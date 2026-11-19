@@ -102,7 +102,7 @@ jobs:
 
           class MainActivity : Activity() {
               class V(val name: String, val bg: Int, val fg: Int)
-              class App(val pkg: String, val icon: Drawable)
+              class App(val pkg: String, val cls: String, val icon: Drawable)
 
               lateinit var apps: List<App>
               lateinit var rootLL: LinearLayout
@@ -116,6 +116,9 @@ jobs:
               var baseS = .45f
               var sel = 0
               var force = true
+              var detail = true
+              var tileK = 1.12f
+              var logoK = .66f
 
               fun px(n: Int) = (n * density).toInt()
               fun hsl(h: Float, s: Float, l: Float) =
@@ -167,16 +170,35 @@ jobs:
                   return if (w > 0) s / w else 0.5
               }
 
-              // Возвращает маску логотипа (в альфа-канале) и флаг: был ли фон светлым (тогда роли цветов меняем местами)
-              fun toMask(fg: Bitmap, full: Bitmap?, mono: Boolean, hint: Boolean): Pair<Bitmap, Boolean> {
+              class M(val mask: Bitmap, val bgLight: Boolean, val complex: Boolean)
+
+              // Делит иконку на логотип и фон. Возвращает маску логотипа (в альфа-канале),
+              // был ли фон светлым и «сложная» ли иконка (объёмная, многоцветная).
+              fun analyze(fg: Bitmap, full: Bitmap?, mono: Boolean, hint: Boolean): M {
                   val w = fg.width
                   val px = IntArray(w * w)
                   fg.getPixels(px, 0, w, 0, 0, w, w)
                   var cov = 0
                   for (p in px) if (Color.alpha(p) > 128) cov++
                   if (mono || full == null || cov < px.size * .55) {
+                      var complex = false
+                      if (!mono && full != null) {
+                          var s1 = 0.0
+                          var s2 = 0.0
+                          var nn = 0
+                          for (p in px) if (Color.alpha(p) > 128) {
+                              val l = lum(p)
+                              s1 += l
+                              s2 += l * l
+                              nn++
+                          }
+                          if (nn > 0) {
+                              val mu = s1 / nn
+                              complex = sqrt(max(0.0, s2 / nn - mu * mu)) > .2
+                          }
+                      }
                       for (i in px.indices) px[i] = (Color.alpha(px[i]) shl 24) or 0xFFFFFF
-                      return Pair(Bitmap.createBitmap(px, w, w, Bitmap.Config.ARGB_8888), hint)
+                      return M(Bitmap.createBitmap(px, w, w, Bitmap.Config.ARGB_8888), hint, complex)
                   }
                   val fp = IntArray(w * w)
                   full.getPixels(fp, 0, w, 0, 0, w, w)
@@ -206,6 +228,10 @@ jobs:
                           thr = i
                       }
                   }
+                  val meanAll = if (tot > 0) sumAll / tot else 0.0
+                  var varSum = 0.0
+                  for (i in 0..255) varSum += hist[i] * (i - meanAll) * (i - meanAll)
+                  val eta = if (varSum > 0 && tot > 0) best / (tot * varSum) else 1.0
                   val t = thr / 255.0
                   var edgeLight = 0
                   var edgeDark = 0
@@ -229,7 +255,40 @@ jobs:
                       val logo = if (bgLight) 1 - sft else sft
                       px[i] = ((Color.alpha(fp[i]) * logo).toInt() shl 24) or 0xFFFFFF
                   }
-                  return Pair(Bitmap.createBitmap(px, w, w, Bitmap.Config.ARGB_8888), bgLight)
+                  return M(Bitmap.createBitmap(px, w, w, Bitmap.Config.ARGB_8888), bgLight, eta < .65)
+              }
+
+              // Градиентная карта: яркость исходной иконки раскладывается между двумя цветами палитры.
+              // Объём, тени и детали сохраняются, а цвета становятся твоими.
+              fun duotone(full: Bitmap, lo: Int, hi: Int): Bitmap {
+                  val w = full.width
+                  val p = IntArray(w * w)
+                  full.getPixels(p, 0, w, 0, 0, w, w)
+                  val hist = IntArray(256)
+                  var n = 0
+                  for (c in p) if (Color.alpha(c) > 128) {
+                      hist[(lum(c) * 255).toInt()]++
+                      n++
+                  }
+                  var a = 0
+                  var acc = 0
+                  while (a < 255 && acc + hist[a] < n * .02) {
+                      acc += hist[a]
+                      a++
+                  }
+                  var b = 255
+                  acc = 0
+                  while (b > 0 && acc + hist[b] < n * .02) {
+                      acc += hist[b]
+                      b--
+                  }
+                  val l0 = a / 255.0
+                  val l1 = max(b / 255.0, l0 + .05)
+                  for (i in p.indices) {
+                      val t = ((lum(p[i]) - l0) / (l1 - l0)).coerceIn(0.0, 1.0)
+                      p[i] = (ColorUtils.blendARGB(lo, hi, t.toFloat()) and 0xFFFFFF) or (Color.alpha(p[i]) shl 24)
+                  }
+                  return Bitmap.createBitmap(p, w, w, Bitmap.Config.ARGB_8888)
               }
 
               // null = приложение не перекрашивается (нет монохромного слоя и выключен принудительный режим)
@@ -237,7 +296,7 @@ jobs:
                   val d = app.icon
                   var mono = false
                   val fgB: Bitmap
-                  var full: Bitmap? = null
+                  val full: Bitmap
                   var hint = false
                   if (d is AdaptiveIconDrawable) {
                       var layer: Drawable? = null
@@ -257,13 +316,39 @@ jobs:
                       fgB = legacyBmp(d)
                       full = fgB
                   }
-                  val res = toMask(fgB, full, mono, hint)
-                  val m = res.first
-                  val bgC = if (res.second) v.fg else v.bg
-                  val fgC = if (res.second) v.bg else v.fg
-                  val n = m.width
+                  val m = analyze(fgB, full, mono, hint)
+                  val s = 192
+                  val out = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
+                  val c = Canvas(out)
+                  val tile = s * tileK
+                  val off = (s - tile) / 2
+                  val rect = RectF(off, off, off + tile, off + tile)
+                  val rad = tile * .27f
+
+                  if (detail && m.complex && !mono) {
+                      val lo = if (lum(v.bg) < lum(v.fg)) v.bg else v.fg
+                      val hi = if (lum(v.bg) < lum(v.fg)) v.fg else v.bg
+                      val d2 = duotone(full, lo, hi)
+                      val tmp = Bitmap.createBitmap(d2.width, d2.height, Bitmap.Config.ARGB_8888)
+                      val tc = Canvas(tmp)
+                      tc.drawColor(lo)
+                      tc.drawBitmap(d2, 0f, 0f, null)
+                      val sh = BitmapShader(tmp, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
+                      val mat = Matrix()
+                      mat.setRectToRect(RectF(0f, 0f, tmp.width.toFloat(), tmp.height.toFloat()), rect, Matrix.ScaleToFit.FILL)
+                      sh.setLocalMatrix(mat)
+                      val sp = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+                      sp.shader = sh
+                      c.drawRoundRect(rect, rad, rad, sp)
+                      return out
+                  }
+
+                  val bgC = if (m.bgLight) v.fg else v.bg
+                  val fgC = if (m.bgLight) v.bg else v.fg
+                  val mk = m.mask
+                  val n = mk.width
                   val mp = IntArray(n * n)
-                  m.getPixels(mp, 0, n, 0, 0, n, n)
+                  mk.getPixels(mp, 0, n, 0, 0, n, n)
                   var x0 = n; var y0 = n; var x1 = -1; var y1 = -1
                   for (y in 0 until n) for (x in 0 until n) {
                       if (Color.alpha(mp[y * n + x]) > 24) {
@@ -273,22 +358,19 @@ jobs:
                           if (y > y1) y1 = y
                       }
                   }
-                  val s = 192
-                  val out = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
-                  val c = Canvas(out)
                   val p = Paint(Paint.ANTI_ALIAS_FLAG)
                   p.color = bgC
-                  c.drawRoundRect(0f, 0f, s.toFloat(), s.toFloat(), s * .27f, s * .27f, p)
+                  c.drawRoundRect(rect, rad, rad, p)
                   if (x1 < 0) return out
                   val w = x1 - x0 + 1
                   val h = y1 - y0 + 1
-                  val k = (s * .56f) / max(w, h)
+                  val k = (s * logoK) / max(w, h)
                   val dw = w * k
                   val dh = h * k
                   val dst = RectF((s - dw) / 2, (s - dh) / 2, (s + dw) / 2, (s + dh) / 2)
                   val pp = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
                   pp.colorFilter = PorterDuffColorFilter(fgC, PorterDuff.Mode.SRC_IN)
-                  c.drawBitmap(m, Rect(x0, y0, x1 + 1, y1 + 1), dst, pp)
+                  c.drawBitmap(mk, Rect(x0, y0, x1 + 1, y1 + 1), dst, pp)
                   return out
               }
 
@@ -370,7 +452,7 @@ jobs:
               // ---------- создание темы ----------
               fun saveMtz(bytes: ByteArray): Uri? {
                   val cv = ContentValues().apply {
-                      put(MediaStore.Downloads.DISPLAY_NAME, "KaiIcons.mtz")
+                  put(MediaStore.Downloads.DISPLAY_NAME, "KaiIcons.mtz")
                       put(MediaStore.Downloads.MIME_TYPE, "application/octet-stream")
                       put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
                   }
@@ -386,13 +468,21 @@ jobs:
                       try {
                           val inner = ByteArrayOutputStream()
                           var n = 0
+                          val seen = HashSet<String>()
                           ZipOutputStream(inner).use { z ->
                               apps.forEachIndexed { i, a ->
                                   val bm = render(a, v)
                                   if (bm != null) {
-                                      z.putNextEntry(ZipEntry("res/drawable-xxhdpi/${a.pkg}.png"))
-                                      bm.compress(Bitmap.CompressFormat.PNG, 100, z)
-                                      z.closeEntry()
+                                      val bo = ByteArrayOutputStream()
+                                      bm.compress(Bitmap.CompressFormat.PNG, 100, bo)
+                                      val pngBytes = bo.toByteArray()
+                                      for (name in listOf(a.cls, a.pkg)) {
+                                          if (seen.add(name)) {
+                                              z.putNextEntry(ZipEntry("res/drawable-xxhdpi/$name.png"))
+                                              z.write(pngBytes)
+                                              z.closeEntry()
+                                          }
+                                      }
                                       n++
                                   }
                                   runOnUiThread { status.text = "Рисую иконки: ${i + 1}/${apps.size}" }
@@ -449,6 +539,26 @@ jobs:
                   setOnClickListener { f(this) }
               }
 
+              fun slider(title: String, min: Int, max: Int, init: Int, f: (Int) -> Unit): LinearLayout {
+                  val box = LinearLayout(this)
+                  box.orientation = LinearLayout.VERTICAL
+                  val t = tv("$title: $init%", 12f, 0xFFA89A96.toInt(), false)
+                  val sb = SeekBar(this)
+                  sb.max = max - min
+                  sb.progress = init - min
+                  sb.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+                      override fun onProgressChanged(sb2: SeekBar?, p: Int, u: Boolean) {
+                          t.text = "$title: ${p + min}%"
+                          f(p + min)
+                      }
+                      override fun onStartTrackingTouch(sb2: SeekBar?) {}
+                      override fun onStopTrackingTouch(sb2: SeekBar?) {}
+                  })
+                  box.addView(t)
+                  box.addView(sb)
+                  return box
+              }
+
               fun iconView(bm: Bitmap?, d: Drawable?, size: Int): ImageView = ImageView(this).apply {
                   if (bm != null) setImageBitmap(bm) else setImageDrawable(d)
                   layoutParams = LinearLayout.LayoutParams(px(size), px(size)).apply { setMargins(px(5), px(5), px(5), px(5)) }
@@ -488,8 +598,8 @@ jobs:
                   val pm = packageManager
                   val q = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
                   apps = pm.queryIntentActivities(q, 0)
-                      .distinctBy { it.activityInfo.packageName }
-                      .map { App(it.activityInfo.packageName, it.loadIcon(pm)) }
+                      .distinctBy { it.activityInfo.name }
+                      .map { App(it.activityInfo.packageName, it.activityInfo.name, it.loadIcon(pm)) }
 
                   rootLL = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
@@ -547,6 +657,17 @@ jobs:
                       setOnCheckedChangeListener { _, b -> force = b; refresh() }
                   }
                   c3.addView(sc, LinearLayout.LayoutParams(-1, -2).apply { topMargin = px(10) })
+                  val sd = Switch(this).apply {
+                      text = "Сохранять объём у сложных иконок"
+                      setTextColor(0xFFF1E6E2.toInt())
+                      isChecked = true
+                      setOnCheckedChangeListener { _, b -> detail = b; refresh() }
+                  }
+                  c3.addView(sd, LinearLayout.LayoutParams(-1, -2).apply { topMargin = px(10) })
+                  c3.addView(slider("Размер плитки", 90, 130, 112) { tileK = it / 100f; refresh() },
+                      LinearLayout.LayoutParams(-1, -2).apply { topMargin = px(10) })
+                  c3.addView(slider("Размер логотипа", 45, 85, 66) { logoK = it / 100f; refresh() },
+                      LinearLayout.LayoutParams(-1, -2).apply { topMargin = px(6) })
                   c3.addView(tv("Если выключить, перекрасятся только приложения с монохромным слоем иконки (Android 13+).", 12f, 0xFFA89A96.toInt(), false))
 
                   status = tv("", 13f, 0xFFA89A96.toInt(), false)
@@ -563,3 +684,4 @@ jobs:
         with:
           name: KaiIcons-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+                 
