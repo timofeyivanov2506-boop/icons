@@ -1,0 +1,489 @@
+name: Build APK
+on: workflow_dispatch
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+      - name: Write project files
+        run: |
+          cat > settings.gradle <<'KAI_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "KaiIcons"
+          include ":app"
+          KAI_EOF
+          cat > build.gradle <<'KAI_EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          KAI_EOF
+          cat > gradle.properties <<'KAI_EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx3g
+          KAI_EOF
+          mkdir -p app
+          cat > app/build.gradle <<'KAI_EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.kai.icons'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.kai.icons'
+                  minSdk 29
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+          }
+          dependencies {
+              implementation 'androidx.core:core-ktx:1.13.1'
+          }
+          KAI_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'KAI_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.MAIN" />
+                      <category android:name="android.intent.category.LAUNCHER" />
+                  </intent>
+              </queries>
+              <application android:label="Kai Icons" android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          KAI_EOF
+          mkdir -p app/src/main/java/com/kai/icons
+          cat > app/src/main/java/com/kai/icons/MainActivity.kt <<'KAI_EOF'
+          package com.kai.icons
+
+          import android.app.Activity
+          import android.app.WallpaperManager
+          import android.content.ContentValues
+          import android.content.Intent
+          import android.graphics.*
+          import android.graphics.drawable.AdaptiveIconDrawable
+          import android.graphics.drawable.Drawable
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Environment
+          import android.provider.MediaStore
+          import android.view.Gravity
+          import android.widget.*
+          import androidx.core.graphics.ColorUtils
+          import java.io.ByteArrayOutputStream
+          import java.util.zip.ZipEntry
+          import java.util.zip.ZipOutputStream
+          import kotlin.math.*
+
+          class MainActivity : Activity() {
+              class V(val name: String, val bg: Int, val fg: Int)
+              class App(val pkg: String, val icon: Drawable)
+
+              lateinit var apps: List<App>
+              lateinit var rootLL: LinearLayout
+              lateinit var wall: ImageView
+              lateinit var sw: LinearLayout
+              lateinit var prev: LinearLayout
+              lateinit var info: TextView
+              lateinit var status: TextView
+              var density = 1f
+              var baseH = 25f
+              var baseS = .45f
+              var sel = 0
+              var force = true
+
+              fun px(n: Int) = (n * density).toInt()
+              fun hsl(h: Float, s: Float, l: Float) =
+                  ColorUtils.HSLToColor(floatArrayOf(((h % 360) + 360) % 360, s.coerceIn(0f, 1f), l))
+
+              fun variants(): List<V> {
+                  val h = baseH
+                  val s = min(baseS, .6f)
+                  return listOf(
+                      V("Тёмный", hsl(h, s * .6f, .17f), hsl(h, max(.25f, s), .82f)),
+                      V("Светлый", hsl(h, s * .6f, .94f), hsl(h, max(.3f, s), .36f)),
+                      V("Яркий", hsl(h, max(.5f, baseS), .46f), hsl(h, .6f, .93f)),
+                      V("Тональный", hsl(h, s * .5f, .30f), hsl(h, s * .6f, .78f))
+                  )
+              }
+
+              // ---------- маски и перекрас ----------
+              fun lum(p: Int) = (0.299 * Color.red(p) + 0.587 * Color.green(p) + 0.114 * Color.blue(p)) / 255.0
+
+              fun layerBmp(ls: List<Drawable?>): Bitmap {
+                  val b = 324
+                  val bm = Bitmap.createBitmap(b, b, Bitmap.Config.ARGB_8888)
+                  val c = Canvas(bm)
+                  for (l in ls) {
+                      if (l == null) continue
+                      l.setBounds(0, 0, b, b)
+                      l.draw(c)
+                  }
+                  return Bitmap.createBitmap(bm, 54, 54, 216, 216)
+              }
+
+              fun legacyBmp(d: Drawable): Bitmap {
+                  val bm = Bitmap.createBitmap(216, 216, Bitmap.Config.ARGB_8888)
+                  d.setBounds(0, 0, 216, 216)
+                  d.draw(Canvas(bm))
+                  return bm
+              }
+
+              fun toMask(fg: Bitmap, full: Bitmap?, mono: Boolean): Bitmap {
+                  val w = fg.width
+                  val px = IntArray(w * w)
+                  fg.getPixels(px, 0, w, 0, 0, w, w)
+                  var cov = 0
+                  for (p in px) if (Color.alpha(p) > 128) cov++
+                  if (mono || full == null || cov < px.size * .55) {
+                      for (i in px.indices) px[i] = (Color.alpha(px[i]) shl 24) or 0xFFFFFF
+                  } else {
+                      val fp = IntArray(w * w)
+                      full.getPixels(fp, 0, w, 0, 0, w, w)
+                      val pts = listOf(.1f to .5f, .9f to .5f, .5f to .1f, .5f to .9f)
+                      var bl = 0.0
+                      for ((a, b) in pts) bl += lum(fp[(b * (w - 1)).toInt() * w + (a * (w - 1)).toInt()])
+                      bl /= pts.size
+                      for (i in px.indices) {
+                          val a = (abs(lum(fp[i]) - bl) * 3.2).coerceAtMost(1.0)
+                          px[i] = ((Color.alpha(fp[i]) * a).toInt() shl 24) or 0xFFFFFF
+                      }
+                  }
+                  return Bitmap.createBitmap(px, w, w, Bitmap.Config.ARGB_8888)
+              }
+
+              // null = приложение не перекрашивается (нет монохромного слоя и выключен принудительный режим)
+              fun render(app: App, v: V): Bitmap? {
+                  val d = app.icon
+                  var mono = false
+                  val fgB: Bitmap
+                  var full: Bitmap? = null
+                  if (d is AdaptiveIconDrawable) {
+                      var layer: Drawable? = null
+                      if (Build.VERSION.SDK_INT >= 33) {
+                          layer = d.monochrome
+                          mono = layer != null
+                      }
+                      if (layer == null) {
+                          if (!force) return null
+                          layer = d.foreground
+                      }
+                      fgB = layerBmp(listOf(layer))
+                      if (!mono) full = layerBmp(listOf(d.background, d.foreground))
+                  } else {
+                      if (!force) return null
+                      fgB = legacyBmp(d)
+                      full = fgB
+                  }
+                  val m = toMask(fgB, full, mono)
+                  val n = m.width
+                  val mp = IntArray(n * n)
+                  m.getPixels(mp, 0, n, 0, 0, n, n)
+                  var x0 = n; var y0 = n; var x1 = -1; var y1 = -1
+                  for (y in 0 until n) for (x in 0 until n) {
+                      if (Color.alpha(mp[y * n + x]) > 24) {
+                          if (x < x0) x0 = x
+                          if (x > x1) x1 = x
+                          if (y < y0) y0 = y
+                          if (y > y1) y1 = y
+                      }
+                  }
+                  val s = 192
+                  val out = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
+                  val c = Canvas(out)
+                  val p = Paint(Paint.ANTI_ALIAS_FLAG)
+                  p.color = v.bg
+                  c.drawRoundRect(0f, 0f, s.toFloat(), s.toFloat(), s * .27f, s * .27f, p)
+                  if (x1 < 0) return out
+                  val w = x1 - x0 + 1
+                  val h = y1 - y0 + 1
+                  val k = (s * .56f) / max(w, h)
+                  val dw = w * k
+                  val dh = h * k
+                  val dst = RectF((s - dw) / 2, (s - dh) / 2, (s + dw) / 2, (s + dh) / 2)
+                  val pp = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+                  pp.colorFilter = PorterDuffColorFilter(v.fg, PorterDuff.Mode.SRC_IN)
+                  c.drawBitmap(m, Rect(x0, y0, x1 + 1, y1 + 1), dst, pp)
+                  return out
+              }
+
+              fun ring(v: V): Bitmap {
+                  val s = 120
+                  val bm = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
+                  val c = Canvas(bm)
+                  val p = Paint(Paint.ANTI_ALIAS_FLAG)
+                  p.color = v.bg
+                  c.drawRoundRect(0f, 0f, s.toFloat(), s.toFloat(), s * .27f, s * .27f, p)
+                  p.color = v.fg
+                  p.style = Paint.Style.STROKE
+                  p.strokeWidth = s * .09f
+                  c.drawCircle(s / 2f, s / 2f, s * .22f, p)
+                  return bm
+              }
+
+              // ---------- обои ----------
+              fun setBaseFromColor(col: Int) {
+                  val hsl = FloatArray(3)
+                  ColorUtils.colorToHSL(col, hsl)
+                  baseH = hsl[0]
+                  baseS = hsl[1].coerceIn(.15f, .9f)
+                  sel = 0
+                  refresh()
+              }
+
+              fun extract(bm: Bitmap) {
+                  val sm = Bitmap.createScaledBitmap(bm, 48, 48, true)
+                  var sx = 0.0; var sy = 0.0; var sw2 = 0.0; var ss = 0.0
+                  val hsl = FloatArray(3)
+                  for (y in 0 until 48) for (x in 0 until 48) {
+                      ColorUtils.colorToHSL(sm.getPixel(x, y), hsl)
+                      val l = hsl[2]
+                      if (l < .08f || l > .95f) continue
+                      val w = (hsl[1] * (1 - abs(2 * l - 1))).toDouble()
+                      val a = Math.toRadians(hsl[0].toDouble())
+                      sx += w * cos(a); sy += w * sin(a); ss += w * hsl[1]; sw2 += w
+                  }
+                  if (sw2 < 1) {
+                      baseS = .06f
+                  } else {
+                      baseH = ((Math.toDegrees(atan2(sy, sx)) + 360) % 360).toFloat()
+                      baseS = (ss / sw2).toFloat().coerceIn(.15f, .9f)
+                  }
+                  sel = 0
+                  refresh()
+              }
+
+              fun fromPhone() {
+                  try {
+                      val wc = WallpaperManager.getInstance(this).getWallpaperColors(WallpaperManager.FLAG_SYSTEM)
+                      if (wc == null) {
+                          status.text = "Не удалось прочитать обои. Выбери картинку из галереи."
+                          return
+                      }
+                      setBaseFromColor(wc.primaryColor.toArgb())
+                      status.text = "Цвета взяты из обоев телефона."
+                  } catch (e: Exception) {
+                      status.text = "Не удалось прочитать обои: ${e.message}"
+                  }
+              }
+
+              @Suppress("DEPRECATION")
+              override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+                  super.onActivityResult(req, res, data)
+                  val uri = data?.data ?: return
+                  if (req != 1 || res != RESULT_OK) return
+                  try {
+                      val o = BitmapFactory.Options().apply { inSampleSize = 4 }
+                      val bm = contentResolver.openInputStream(uri).use { BitmapFactory.decodeStream(it, null, o) }!!
+                      wall.setImageBitmap(bm)
+                      extract(bm)
+                  } catch (e: Exception) {
+                      status.text = "Не удалось открыть картинку: ${e.message}"
+                  }
+              }
+
+              // ---------- создание темы ----------
+              fun saveMtz(bytes: ByteArray): Uri? {
+                  val cv = ContentValues().apply {
+                      put(MediaStore.Downloads.DISPLAY_NAME, "KaiIcons.mtz")
+                      put(MediaStore.Downloads.MIME_TYPE, "application/octet-stream")
+                      put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                  }
+                  val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv) ?: return null
+                  contentResolver.openOutputStream(uri)!!.use { it.write(bytes) }
+                  return uri
+              }
+
+              fun create(btn: Button) {
+                  btn.isEnabled = false
+                  val v = variants()[sel]
+                  Thread {
+                      try {
+                          val inner = ByteArrayOutputStream()
+                          var n = 0
+                          ZipOutputStream(inner).use { z ->
+                              apps.forEachIndexed { i, a ->
+                                  val bm = render(a, v)
+                                  if (bm != null) {
+                                      z.putNextEntry(ZipEntry("res/drawable-xxhdpi/${a.pkg}.png"))
+                                      bm.compress(Bitmap.CompressFormat.PNG, 100, z)
+                                      z.closeEntry()
+                                      n++
+                                  }
+                                  runOnUiThread { status.text = "Рисую иконки: ${i + 1}/${apps.size}" }
+                              }
+                          }
+                          val outer = ByteArrayOutputStream()
+                          ZipOutputStream(outer).use { z ->
+                              z.putNextEntry(ZipEntry("description.xml"))
+                              z.write("""<?xml version="1.0" encoding="utf-8"?><theme><title>Kai Icons</title><author>Kai Icons</author><designer>Kai Icons</designer><version>1.0</version><uiVersion>12</uiVersion></theme>""".toByteArray())
+                              z.closeEntry()
+                              z.putNextEntry(ZipEntry("icons"))
+                              z.write(inner.toByteArray())
+                              z.closeEntry()
+                          }
+                          val uri = saveMtz(outer.toByteArray())
+                          runOnUiThread {
+                              btn.isEnabled = true
+                              status.text = "Готово: $n иконок. Файл KaiIcons.mtz лежит в Загрузках."
+                              if (uri != null) try {
+                                  startActivity(Intent(Intent.ACTION_VIEW).setDataAndType(uri, "application/octet-stream")
+                                      .setPackage("com.android.thememanager").addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION))
+                              } catch (e: Exception) {
+                                  status.text = status.text.toString() + " Открой его через «Темы» вручную."
+                              }
+                          }
+                      } catch (e: Throwable) {
+                          runOnUiThread { btn.isEnabled = true; status.text = "Ошибка: ${e.message}" }
+                      }
+                  }.start()
+              }
+
+              // ---------- интерфейс ----------
+              fun tv(t: String, size: Float, color: Int, bold: Boolean) = TextView(this).apply {
+                  text = t; textSize = size; setTextColor(color)
+                  if (bold) setTypeface(typeface, Typeface.BOLD)
+              }
+
+              fun card(title: String): LinearLayout {
+                  val c = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(px(14), px(14), px(14), px(14))
+                      background = GradientDrawable().apply { setColor(0xFF262020.toInt()); cornerRadius = px(20).toFloat() }
+                  }
+                  c.addView(tv(title, 15f, 0xFFF1E6E2.toInt(), true))
+                  val lp = LinearLayout.LayoutParams(-1, -2)
+                  lp.topMargin = px(12)
+                  rootLL.addView(c, lp)
+                  return c
+              }
+
+              fun btn(t: String, bg: Int, fg: Int, f: (Button) -> Unit) = Button(this).apply {
+                  text = t; isAllCaps = false; setTextColor(fg)
+                  background = GradientDrawable().apply { setColor(bg); cornerRadius = px(14).toFloat() }
+                  setOnClickListener { f(this) }
+              }
+
+              fun iconView(bm: Bitmap?, d: Drawable?, size: Int): ImageView = ImageView(this).apply {
+                  if (bm != null) setImageBitmap(bm) else setImageDrawable(d)
+                  layoutParams = LinearLayout.LayoutParams(px(size), px(size)).apply { setMargins(px(5), px(5), px(5), px(5)) }
+              }
+
+              fun refresh() {
+                  val vs = variants()
+                  val v = vs[sel]
+                  sw.removeAllViews()
+                  vs.forEachIndexed { i, x ->
+                      val col = LinearLayout(this).apply {
+                          orientation = LinearLayout.VERTICAL
+                          gravity = Gravity.CENTER_HORIZONTAL
+                          setPadding(px(6), px(6), px(6), px(6))
+                          background = GradientDrawable().apply {
+                              cornerRadius = px(16).toFloat()
+                              if (i == sel) setStroke(px(2), 0xFFF4A58F.toInt())
+                          }
+                          setOnClickListener { sel = i; refresh() }
+                      }
+                      col.addView(iconView(ring(x), null, 52))
+                      col.addView(tv(x.name, 11f, 0xFFA89A96.toInt(), false))
+                      sw.addView(col)
+                  }
+                  info.text = "фон #%06X · логотип #%06X · контраст %.1f:1".format(
+                      v.bg and 0xFFFFFF, v.fg and 0xFFFFFF, ColorUtils.calculateContrast(v.fg, v.bg))
+                  prev.removeAllViews()
+                  apps.take(6).forEach { a ->
+                      val bm = render(a, v)
+                      prev.addView(iconView(bm, a.icon, 48))
+                  }
+              }
+
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  density = resources.displayMetrics.density
+                  val pm = packageManager
+                  val q = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                  apps = pm.queryIntentActivities(q, 0)
+                      .distinctBy { it.activityInfo.packageName }
+                      .map { App(it.activityInfo.packageName, it.loadIcon(pm)) }
+
+                  rootLL = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(px(14), px(34), px(14), px(34))
+                  }
+                  setContentView(ScrollView(this).apply { setBackgroundColor(0xFF1A1514.toInt()); addView(rootLL) })
+
+                  rootLL.addView(tv("✦ Kai Icons", 22f, 0xFFF1E6E2.toInt(), true))
+                  rootLL.addView(tv("иконки для Xiaomi из цветов твоих обоев", 13f, 0xFFA89A96.toInt(), false))
+
+                  val c1 = card("Обои")
+                  wall = ImageView(this).apply {
+                      scaleType = ImageView.ScaleType.CENTER_CROP
+                      setBackgroundColor(0xFF000000.toInt())
+                  }
+                  c1.addView(wall, LinearLayout.LayoutParams(-1, px(150)).apply { topMargin = px(8) })
+                  val row = LinearLayout(this)
+                  row.addView(btn("Обои телефона", 0xFF322A29.toInt(), 0xFFF1E6E2.toInt()) { fromPhone() },
+                      LinearLayout.LayoutParams(0, -2, 1f))
+                  row.addView(btn("Галерея", 0xFF322A29.toInt(), 0xFFF1E6E2.toInt()) {
+                      @Suppress("DEPRECATION")
+                      startActivityForResult(Intent(Intent.ACTION_GET_CONTENT).setType("image/*"), 1)
+                  }, LinearLayout.LayoutParams(0, -2, 1f))
+                  c1.addView(row)
+
+                  val c2 = card("Цвета")
+                  sw = LinearLayout(this)
+                  c2.addView(HorizontalScrollView(this).apply { addView(sw) })
+                  info = tv("", 12f, 0xFFA89A96.toInt(), false)
+                  c2.addView(info)
+
+                  val c3 = card("Так будет выглядеть")
+                  prev = LinearLayout(this)
+                  c3.addView(HorizontalScrollView(this).apply { addView(prev) })
+                  val sc = Switch(this).apply {
+                      text = "Принудительный перекрас приложений (${apps.size})"
+                      setTextColor(0xFFF1E6E2.toInt())
+                      isChecked = true
+                      setOnCheckedChangeListener { _, b -> force = b; refresh() }
+                  }
+                  c3.addView(sc, LinearLayout.LayoutParams(-1, -2).apply { topMargin = px(10) })
+                  c3.addView(tv("Если выключить, перекрасятся только приложения с монохромным слоем иконки (Android 13+).", 12f, 0xFFA89A96.toInt(), false))
+
+                  status = tv("", 13f, 0xFFA89A96.toInt(), false)
+                  rootLL.addView(btn("✦ Создать иконки", 0xFFF4A58F.toInt(), 0xFF2A1410.toInt()) { create(it) },
+                      LinearLayout.LayoutParams(-1, px(56)).apply { topMargin = px(14) })
+                  rootLL.addView(status, LinearLayout.LayoutParams(-1, -2).apply { topMargin = px(8) })
+                  refresh()
+              }
+          }
+          KAI_EOF
+      - name: Build
+        run: gradle assembleDebug --no-daemon --stacktrace
+      - uses: actions/upload-artifact@v4
+        with:
+          name: KaiIcons-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
