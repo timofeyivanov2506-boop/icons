@@ -95,30 +95,57 @@ jobs:
           import android.view.Gravity
           import android.widget.*
           import androidx.core.graphics.ColorUtils
+          import java.io.ByteArrayInputStream
           import java.io.ByteArrayOutputStream
+          import java.util.zip.CRC32
           import java.util.zip.ZipEntry
+          import java.util.zip.ZipInputStream
           import java.util.zip.ZipOutputStream
           import kotlin.math.*
+
+          // Профиль края плитки (как в эталонной теме): смещение левого края для верхних 96 строк
+          private val EDGE = floatArrayOf(38.23f, 33.13f, 29.71f, 27.06f, 24.83f, 22.89f, 21.13f, 19.58f, 18.13f, 16.85f, 15.63f, 14.43f, 13.37f, 12.37f, 11.43f, 10.63f, 9.81f, 8.98f, 8.17f, 7.58f, 6.93f, 6.2f, 5.79f, 5.1f, 4.74f, 4.11f, 3.81f, 3.23f, 2.95f, 2.61f, 2.16f, 1.95f, 1.73f, 1.34f, 1.13f, 0.98f, 0.84f, 0.67f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f)
 
           class MainActivity : Activity() {
               class V(val name: String, val bg: Int, val fg: Int)
               class App(val pkg: String, val cls: String, val icon: Drawable)
+              class M(val mask: Bitmap, val bgLight: Boolean, val complex: Boolean)
 
               lateinit var apps: List<App>
+              lateinit var uniq: List<App>
               lateinit var rootLL: LinearLayout
               lateinit var wall: ImageView
               lateinit var sw: LinearLayout
               lateinit var prev: LinearLayout
               lateinit var info: TextView
               lateinit var status: TextView
+              lateinit var baseInfo: TextView
               var density = 1f
               var baseH = 25f
               var baseS = .45f
+              var accentH = 205f
               var sel = 0
               var force = true
               var detail = true
-              var tileK = 1.12f
               var logoK = .66f
+              val baseIcons = LinkedHashMap<String, Bitmap>()
+              val baseExtra = LinkedHashMap<String, ByteArray>()
+              var baseTile = 0
+              var baseLogo = 0
+
+              val tile: Path by lazy {
+                  val p = Path()
+                  val n = 192
+                  fun l(y: Int) = EDGE[min(y, n - 1 - y)]
+                  p.moveTo(l(0), 0f)
+                  for (y in 0 until n) p.lineTo(l(y), y + 0.5f)
+                  p.lineTo(l(n - 1), n.toFloat())
+                  p.lineTo(n - l(n - 1), n.toFloat())
+                  for (y in n - 1 downTo 0) p.lineTo(n - l(y), y + 0.5f)
+                  p.lineTo(n - l(0), 0f)
+                  p.close()
+                  p
+              }
 
               fun px(n: Int) = (n * density).toInt()
               fun hsl(h: Float, s: Float, l: Float) =
@@ -131,12 +158,21 @@ jobs:
                       V("Тёмный", hsl(h, s * .6f, .17f), hsl(h, max(.25f, s), .82f)),
                       V("Светлый", hsl(h, s * .6f, .94f), hsl(h, max(.3f, s), .36f)),
                       V("Яркий", hsl(h, max(.5f, baseS), .46f), hsl(h, .6f, .93f)),
-                      V("Тональный", hsl(h, s * .5f, .30f), hsl(h, s * .6f, .78f))
+                      V("Тональный", hsl(h, s * .5f, .30f), hsl(h, s * .6f, .78f)),
+                      V("Акцент", hsl(accentH, s * .5f, .20f), hsl(h, max(.45f, s), .72f))
                   )
               }
 
-              // ---------- маски и перекрас ----------
+              // ---------- общие помощники ----------
               fun lum(p: Int) = (0.299 * Color.red(p) + 0.587 * Color.green(p) + 0.114 * Color.blue(p)) / 255.0
+
+              fun tileBitmap(color: Int): Bitmap {
+                  val bm = Bitmap.createBitmap(192, 192, Bitmap.Config.ARGB_8888)
+                  val p = Paint(Paint.ANTI_ALIAS_FLAG)
+                  p.color = color
+                  Canvas(bm).drawPath(tile, p)
+                  return bm
+              }
 
               fun layerBmp(ls: List<Drawable?>): Bitmap {
                   val b = 324
@@ -170,10 +206,7 @@ jobs:
                   return if (w > 0) s / w else 0.5
               }
 
-              class M(val mask: Bitmap, val bgLight: Boolean, val complex: Boolean)
-
-              // Делит иконку на логотип и фон. Возвращает маску логотипа (в альфа-канале),
-              // был ли фон светлым и «сложная» ли иконка (объёмная, многоцветная).
+              // ---------- анализ иконки ----------
               fun analyze(fg: Bitmap, full: Bitmap?, mono: Boolean, hint: Boolean): M {
                   val w = fg.width
                   val px = IntArray(w * w)
@@ -257,13 +290,15 @@ jobs:
                   }
                   return M(Bitmap.createBitmap(px, w, w, Bitmap.Config.ARGB_8888), bgLight, eta < .65)
               }
+                            // Ступени тона как в эталонной теме: фон, три полутона, чистый цвет логотипа
+              fun tones(t: Double): Double {
+                  val lv = doubleArrayOf(0.0, .37, .63, .9, 1.0)
+                  var best = lv[0]
+                  for (x in lv) if (abs(x - t) < abs(best - t)) best = x
+                  return .7 * best + .3 * t
+              }
 
-              // Градиентная карта: яркость исходной иконки раскладывается между двумя цветами палитры.
-              // Объём, тени и детали сохраняются, а цвета становятся твоими.
-              fun duotone(full: Bitmap, lo: Int, hi: Int): Bitmap {
-                  val w = full.width
-                  val p = IntArray(w * w)
-                  full.getPixels(p, 0, w, 0, 0, w, w)
+              fun range(p: IntArray): Pair<Double, Double> {
                   val hist = IntArray(256)
                   var n = 0
                   for (c in p) if (Color.alpha(c) > 128) {
@@ -282,16 +317,38 @@ jobs:
                       acc += hist[b]
                       b--
                   }
-                  val l0 = a / 255.0
-                  val l1 = max(b / 255.0, l0 + .05)
+                  return Pair(a / 255.0, max(b / 255.0, a / 255.0 + .05))
+              }
+
+              // Вся иконка целиком (если нет отдельных слоёв): яркость между двумя цветами, с полутонами
+              fun duotone(full: Bitmap, lo: Int, hi: Int): Bitmap {
+                  val w = full.width
+                  val p = IntArray(w * w)
+                  full.getPixels(p, 0, w, 0, 0, w, w)
+                  val r = range(p)
                   for (i in p.indices) {
-                      val t = ((lum(p[i]) - l0) / (l1 - l0)).coerceIn(0.0, 1.0)
+                      val t = tones(((lum(p[i]) - r.first) / (r.second - r.first)).coerceIn(0.0, 1.0))
                       p[i] = (ColorUtils.blendARGB(lo, hi, t.toFloat()) and 0xFFFFFF) or (Color.alpha(p[i]) shl 24)
                   }
                   return Bitmap.createBitmap(p, w, w, Bitmap.Config.ARGB_8888)
               }
 
-              // null = приложение не перекрашивается (нет монохромного слоя и выключен принудительный режим)
+              // Слой логотипа поверх плоской плитки: детали остаются, цвета палитры
+              fun logoLayer(fg: Bitmap, v: V, inv: Boolean): Bitmap {
+                  val w = fg.width
+                  val p = IntArray(w * w)
+                  fg.getPixels(p, 0, w, 0, 0, w, w)
+                  val r = range(p)
+                  for (i in p.indices) {
+                      var t = ((lum(p[i]) - r.first) / (r.second - r.first)).coerceIn(0.0, 1.0)
+                      if (inv) t = 1 - t
+                      val k = .28 + .72 * tones(t)
+                      p[i] = (ColorUtils.blendARGB(v.bg, v.fg, k.toFloat()) and 0xFFFFFF) or (Color.alpha(p[i]) shl 24)
+                  }
+                  return Bitmap.createBitmap(p, w, w, Bitmap.Config.ARGB_8888)
+              }
+
+              // Своя иконка для приложения, которого нет в базовой теме. null = не перекрашиваем
               fun render(app: App, v: V): Bitmap? {
                   val d = app.icon
                   var mono = false
@@ -320,12 +377,22 @@ jobs:
                   val s = 192
                   val out = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
                   val c = Canvas(out)
-                  val tile = s * tileK
-                  val off = (s - tile) / 2
-                  val rect = RectF(off, off, off + tile, off + tile)
-                  val rad = tile * .27f
 
                   if (detail && m.complex && !mono) {
+                      if (d is AdaptiveIconDrawable) {
+                          val p0 = Paint(Paint.ANTI_ALIAS_FLAG)
+                          p0.color = v.bg
+                          c.drawPath(tile, p0)
+                          val lg = logoLayer(fgB, v, hint)
+                          val sc = (s / 216f) * (logoK / .66f)
+                          c.save()
+                          c.translate(s / 2f, s / 2f)
+                          c.scale(sc, sc)
+                          c.translate(-108f, -108f)
+                          c.drawBitmap(lg, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG))
+                          c.restore()
+                          return out
+                      }
                       val lo = if (lum(v.bg) < lum(v.fg)) v.bg else v.fg
                       val hi = if (lum(v.bg) < lum(v.fg)) v.fg else v.bg
                       val d2 = duotone(full, lo, hi)
@@ -335,11 +402,11 @@ jobs:
                       tc.drawBitmap(d2, 0f, 0f, null)
                       val sh = BitmapShader(tmp, Shader.TileMode.CLAMP, Shader.TileMode.CLAMP)
                       val mat = Matrix()
-                      mat.setRectToRect(RectF(0f, 0f, tmp.width.toFloat(), tmp.height.toFloat()), rect, Matrix.ScaleToFit.FILL)
+                      mat.setScale(s / 216f, s / 216f)
                       sh.setLocalMatrix(mat)
                       val sp = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
                       sp.shader = sh
-                      c.drawRoundRect(rect, rad, rad, sp)
+                      c.drawPath(tile, sp)
                       return out
                   }
 
@@ -360,7 +427,7 @@ jobs:
                   }
                   val p = Paint(Paint.ANTI_ALIAS_FLAG)
                   p.color = bgC
-                  c.drawRoundRect(rect, rad, rad, p)
+                  c.drawPath(tile, p)
                   if (x1 < 0) return out
                   val w = x1 - x0 + 1
                   val h = y1 - y0 + 1
@@ -374,47 +441,180 @@ jobs:
                   return out
               }
 
-              fun ring(v: V): Bitmap {
-                  val s = 120
-                  val bm = Bitmap.createBitmap(s, s, Bitmap.Config.ARGB_8888)
-                  val c = Canvas(bm)
-                  val p = Paint(Paint.ANTI_ALIAS_FLAG)
-                  p.color = v.bg
-                  c.drawRoundRect(0f, 0f, s.toFloat(), s.toFloat(), s * .27f, s * .27f, p)
-                  p.color = v.fg
-                  p.style = Paint.Style.STROKE
-                  p.strokeWidth = s * .09f
-                  c.drawCircle(s / 2f, s / 2f, s * .22f, p)
-                  return bm
+              // ---------- базовая тема (.mtz): её иконки остаются как есть, меняется только цвет ----------
+              fun recolor(src: Bitmap, t0: Int, l0: Int, t1: Int, l1: Int): Bitmap {
+                  val w = src.width
+                  val h = src.height
+                  val p = IntArray(w * h)
+                  src.getPixels(p, 0, w, 0, 0, w, h)
+                  val dr = (Color.red(l0) - Color.red(t0)).toDouble()
+                  val dg = (Color.green(l0) - Color.green(t0)).toDouble()
+                  val db = (Color.blue(l0) - Color.blue(t0)).toDouble()
+                  val den = dr * dr + dg * dg + db * db
+                  if (den < 1) return src
+                  for (i in p.indices) {
+                      val a = Color.alpha(p[i])
+                      if (a == 0) continue
+                      val t = (((Color.red(p[i]) - Color.red(t0)) * dr + (Color.green(p[i]) - Color.green(t0)) * dg +
+                          (Color.blue(p[i]) - Color.blue(t0)) * db) / den).coerceIn(0.0, 1.0)
+                      p[i] = (ColorUtils.blendARGB(t1, l1, t.toFloat()) and 0xFFFFFF) or (a shl 24)
+                  }
+                  return Bitmap.createBitmap(p, w, h, Bitmap.Config.ARGB_8888)
               }
 
-              // ---------- обои ----------
-              fun setBaseFromColor(col: Int) {
+              fun baseIcon(name: String, v: V): Bitmap? {
+                  val src = baseIcons[name] ?: return null
+                  return recolor(src, baseTile, baseLogo, v.bg, v.fg)
+              }
+
+              fun cfgColor(cfg: String, key: String): Int? {
+                  val m = Regex(key + "\" value=\"(#[0-9A-Fa-f]{6})\"").find(cfg) ?: return null
+                  return Color.parseColor(m.groupValues[1])
+              }
+
+              fun importBase(uri: Uri) {
+                  try {
+                      val bytes = contentResolver.openInputStream(uri)!!.use { it.readBytes() }
+                      var iconsBytes: ByteArray? = null
+                      ZipInputStream(ByteArrayInputStream(bytes)).use { z ->
+                          var e = z.nextEntry
+                          while (e != null) {
+                              if (e.name == "icons") iconsBytes = z.readBytes()
+                              e = z.nextEntry
+                          }
+                      }
+                      val ib = iconsBytes ?: throw Exception("в файле нет архива icons")
+                      val icons = LinkedHashMap<String, Bitmap>()
+                      val extra = LinkedHashMap<String, ByteArray>()
+                      var cfg = ""
+                      var tileColor = 0
+                      ZipInputStream(ByteArrayInputStream(ib)).use { z ->
+                          var e = z.nextEntry
+                          while (e != null) {
+                              val nm = e.name
+                              val data = z.readBytes()
+                              if (nm == "transform_config.xml") {
+                                  cfg = String(data)
+                              } else if (nm.startsWith("res/drawable-xxhdpi/") && nm.endsWith(".png")) {
+                                  val key = nm.removePrefix("res/drawable-xxhdpi/").removeSuffix(".png")
+                                  if (key == "icon_pattern") {
+                                      val bm = BitmapFactory.decodeByteArray(data, 0, data.size)
+                                      if (bm != null) tileColor = bm.getPixel(bm.width / 2, bm.height / 2) or 0xFF000000.toInt()
+                                  } else if (key.startsWith("icon_") || key.startsWith("folder_")) {
+                                      extra[nm] = data
+                                  } else {
+                                      val bm = BitmapFactory.decodeByteArray(data, 0, data.size)
+                                      if (bm != null) icons[key] = bm
+                                  }
+                              }
+                              e = z.nextEntry
+                          }
+                      }
+                      if (icons.isEmpty()) throw Exception("в архиве нет иконок")
+                      if (tileColor == 0) tileColor = cfgColor(cfg, "BlackColor") ?: 0xFF202020.toInt()
+                      val black = cfgColor(cfg, "BlackColor")
+                      val white = cfgColor(cfg, "WhiteColor")
+                      var logo = if (lum(tileColor) < .5) 0xFFFFFFFF.toInt() else 0xFF000000.toInt()
+                      if (black != null && white != null) {
+                          logo = if (abs(lum(white) - lum(tileColor)) > abs(lum(black) - lum(tileColor))) white else black
+                      }
+                      baseIcons.clear(); baseExtra.clear()
+                      baseIcons.putAll(icons); baseExtra.putAll(extra)
+                      baseTile = tileColor
+                      baseLogo = logo or 0xFF000000.toInt()
+                      baseInfo.text = "Загружено иконок: ${icons.size}. Они сохранятся как есть и перекрасятся в твои цвета."
+                      refresh()
+                  } catch (e: Exception) {
+                      baseInfo.text = "Не удалось прочитать тему: ${e.message}"
+                  }
+              }
+
+              // ---------- обои и палитра ----------
+              fun hueDist(a: Float, b: Float) = abs((((a - b) % 360) + 540) % 360 - 180)
+
+              fun setBaseFromColor(col: Int, accentCol: Int? = null) {
                   val hsl = FloatArray(3)
                   ColorUtils.colorToHSL(col, hsl)
                   baseH = hsl[0]
                   baseS = hsl[1].coerceIn(.15f, .9f)
+                  accentH = (baseH + 180) % 360
+                  if (accentCol != null) {
+                      val h2 = FloatArray(3)
+                      ColorUtils.colorToHSL(accentCol, h2)
+                      if (h2[1] > .15f && hueDist(h2[0], baseH) > 30f) accentH = h2[0]
+                  }
                   sel = 0
                   refresh()
               }
 
+              // Подбор цвета под картинку: кластеры цветов, выигрывает самый заметный (много пикселей и насыщенный)
               fun extract(bm: Bitmap) {
-                  val sm = Bitmap.createScaledBitmap(bm, 48, 48, true)
-                  var sx = 0.0; var sy = 0.0; var sw2 = 0.0; var ss = 0.0
-                  val hsl = FloatArray(3)
-                  for (y in 0 until 48) for (x in 0 until 48) {
-                      ColorUtils.colorToHSL(sm.getPixel(x, y), hsl)
-                      val l = hsl[2]
-                      if (l < .08f || l > .95f) continue
-                      val w = (hsl[1] * (1 - abs(2 * l - 1))).toDouble()
-                      val a = Math.toRadians(hsl[0].toDouble())
-                      sx += w * cos(a); sy += w * sin(a); ss += w * hsl[1]; sw2 += w
+                  val sm = Bitmap.createScaledBitmap(bm, 40, 40, true)
+                  val n = 1600
+                  val px = IntArray(n)
+                  sm.getPixels(px, 0, 40, 0, 0, 40, 40)
+                  val k = 6
+                  val cr = DoubleArray(k)
+                  val cg = DoubleArray(k)
+                  val cb = DoubleArray(k)
+                  for (j in 0 until k) {
+                      val c = px[(j * n / k + n / (2 * k)) % n]
+                      cr[j] = Color.red(c).toDouble()
+                      cg[j] = Color.green(c).toDouble()
+                      cb[j] = Color.blue(c).toDouble()
                   }
-                  if (sw2 < 1) {
+                  val asg = IntArray(n)
+                  repeat(8) {
+                      val sr = DoubleArray(k)
+                      val sg = DoubleArray(k)
+                      val sb = DoubleArray(k)
+                      val cnt = IntArray(k)
+                      for (i in 0 until n) {
+                          val r = Color.red(px[i]).toDouble()
+                          val g = Color.green(px[i]).toDouble()
+                          val b = Color.blue(px[i]).toDouble()
+                          var bj = 0
+                          var bd = Double.MAX_VALUE
+                          for (j in 0 until k) {
+                              val d = (r - cr[j]) * (r - cr[j]) + (g - cg[j]) * (g - cg[j]) + (b - cb[j]) * (b - cb[j])
+                              if (d < bd) {
+                                  bd = d
+                                  bj = j
+                              }
+                          }
+                          asg[i] = bj
+                          sr[bj] += r; sg[bj] += g; sb[bj] += b
+                          cnt[bj]++
+                      }
+                      for (j in 0 until k) if (cnt[j] > 0) {
+                          cr[j] = sr[j] / cnt[j]
+                          cg[j] = sg[j] / cnt[j]
+                          cb[j] = sb[j] / cnt[j]
+                      }
+                  }
+                  val cnt = IntArray(k)
+                  for (a in asg) cnt[a]++
+                  val hsl = FloatArray(3)
+                  val found = ArrayList<Triple<Double, Float, Float>>()
+                  for (j in 0 until k) {
+                      if (cnt[j] == 0) continue
+                      ColorUtils.colorToHSL(Color.rgb(cr[j].toInt(), cg[j].toInt(), cb[j].toInt()), hsl)
+                      val score = cnt[j] * hsl[1].toDouble().pow(1.5) * (1 - abs(2 * hsl[2] - 1))
+                      found.add(Triple(score, hsl[0], hsl[1]))
+                  }
+                  found.sortByDescending { it.first }
+                  if (found.isEmpty() || found[0].first < 1.0) {
                       baseS = .06f
                   } else {
-                      baseH = ((Math.toDegrees(atan2(sy, sx)) + 360) % 360).toFloat()
-                      baseS = (ss / sw2).toFloat().coerceIn(.15f, .9f)
+                      baseH = found[0].second
+                      baseS = found[0].third.coerceIn(.15f, .9f)
+                      accentH = (baseH + 180) % 360
+                      for (f in found) {
+                          if (f.first > 1.0 && hueDist(f.second, baseH) > 40f) {
+                              accentH = f.second
+                              break
+                          }
+                      }
                   }
                   sel = 0
                   refresh()
@@ -427,7 +627,8 @@ jobs:
                           status.text = "Не удалось прочитать обои. Выбери картинку из галереи."
                           return
                       }
-                      setBaseFromColor(wc.primaryColor.toArgb())
+                      val second = wc.secondaryColor
+                      setBaseFromColor(wc.primaryColor.toArgb(), second?.toArgb())
                       status.text = "Цвета взяты из обоев телефона."
                   } catch (e: Exception) {
                       status.text = "Не удалось прочитать обои: ${e.message}"
@@ -438,21 +639,94 @@ jobs:
               override fun onActivityResult(req: Int, res: Int, data: Intent?) {
                   super.onActivityResult(req, res, data)
                   val uri = data?.data ?: return
-                  if (req != 1 || res != RESULT_OK) return
-                  try {
-                      val o = BitmapFactory.Options().apply { inSampleSize = 4 }
-                      val bm = contentResolver.openInputStream(uri).use { BitmapFactory.decodeStream(it, null, o) }!!
-                      wall.setImageBitmap(bm)
-                      extract(bm)
-                  } catch (e: Exception) {
-                      status.text = "Не удалось открыть картинку: ${e.message}"
+                  if (res != RESULT_OK) return
+                  if (req == 1) {
+                      try {
+                          val o = BitmapFactory.Options().apply { inSampleSize = 4 }
+                          val bm = contentResolver.openInputStream(uri).use { BitmapFactory.decodeStream(it, null, o) }!!
+                          wall.setImageBitmap(bm)
+                          extract(bm)
+                      } catch (e: Exception) {
+                          status.text = "Не удалось открыть картинку: ${e.message}"
+                      }
+                  } else if (req == 2) {
+                      importBase(uri)
                   }
               }
+                            // ---------- сборка темы ----------
+              fun png(b: Bitmap): ByteArray {
+                  val o = ByteArrayOutputStream()
+                  b.compress(Bitmap.CompressFormat.PNG, 100, o)
+                  return o.toByteArray()
+              }
 
-              // ---------- создание темы ----------
+              fun stored(z: ZipOutputStream, name: String, data: ByteArray) {
+                  val e = ZipEntry(name)
+                  e.method = ZipEntry.STORED
+                  e.size = data.size.toLong()
+                  e.compressedSize = data.size.toLong()
+                  val crc = CRC32()
+                  crc.update(data)
+                  e.crc = crc.value
+                  z.putNextEntry(e)
+                  z.write(data)
+                  z.closeEntry()
+              }
+
+              fun hex(c: Int) = "#%06X".format(c and 0xFFFFFF)
+
+              fun config(v: V): String {
+                  val lo = if (lum(v.bg) < lum(v.fg)) v.bg else v.fg
+                  val hi = if (lum(v.bg) < lum(v.fg)) v.fg else v.bg
+                  return """<?xml version="1.0" encoding="UTF-8"?>
+          <IconTransform>
+              <PointsMapping>
+                  <Point fromX="0.0" fromY="0.0" toX="6.5" toY="6.5"/>
+                  <Point fromX="0.0" fromY="90.0" toX="6.5" toY="83.5"/>
+                  <Point fromX="90.0" fromY="90.0" toX="83.5" toY="83.5"/>
+                  <Point fromX="90.0" fromY="0.0" toX="83.5" toY="6.5"/>
+              </PointsMapping>
+              <IconFilters>
+                  <Filter name="GrayScale">
+                      <Param name="BlackColor" value="${hex(lo)}"/>
+                      <Param name="WhiteColor" value="${hex(hi)}"/>
+                  </Filter>
+              </IconFilters>
+          </IconTransform>"""
+              }
+
+              fun description(): String {
+                  return """<?xml version="1.0" encoding="utf-8" standalone="no"?>
+          <theme>
+          <version><![CDATA[1.0]]></version>
+          <uiVersion>17</uiVersion>
+          <author><![CDATA[Kai Icons]]></author>
+          <designer><![CDATA[Kai Icons]]></designer>
+          <title><![CDATA[Kai Icons]]></title>
+          <description><![CDATA[Icon theme made with Kai Icons.]]></description>
+          <authors>
+          <author locale="en_US"><![CDATA[Kai Icons]]></author>
+          <author locale="zh_CN"><![CDATA[Kai Icons]]></author>
+          </authors>
+          <designers>
+          <designer locale="en_US"><![CDATA[Kai Icons]]></designer>
+          <designer locale="zh_CN"><![CDATA[Kai Icons]]></designer>
+          </designers>
+          <titles>
+          <title locale="en_US"><![CDATA[Kai Icons]]></title>
+          <title locale="zh_CN"><![CDATA[Kai Icons]]></title>
+          </titles>
+          <descriptions>
+          <description locale="en_US"><![CDATA[Icon theme made with Kai Icons.]]></description>
+          <description locale="zh_CN"><![CDATA[Icon theme made with Kai Icons.]]></description>
+          </descriptions>
+          <miuiAdapterVersion>3.2</miuiAdapterVersion>
+          </theme>"""
+              }
+
               fun saveMtz(bytes: ByteArray): Uri? {
                   val cv = ContentValues().apply {
-                  put(MediaStore.Downloads.DISPLAY_NAME, "KaiIcons.mtz")
+                      put(MediaStore.Downloads.DISPLAY_NAME, "KaiIcons.mtz")
                       put(MediaStore.Downloads.MIME_TYPE, "application/octet-stream")
                       put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
                   }
@@ -467,35 +741,42 @@ jobs:
                   Thread {
                       try {
                           val inner = ByteArrayOutputStream()
-                          var n = 0
                           val seen = HashSet<String>()
+                          val written = HashSet<String>()
+                          var n = 0
                           ZipOutputStream(inner).use { z ->
-                              apps.forEachIndexed { i, a ->
-                                  val bm = render(a, v)
-                                  if (bm != null) {
-                                      val bo = ByteArrayOutputStream()
-                                      bm.compress(Bitmap.CompressFormat.PNG, 100, bo)
-                                      val pngBytes = bo.toByteArray()
-                                      for (name in listOf(a.cls, a.pkg)) {
-                                          if (seen.add(name)) {
-                                              z.putNextEntry(ZipEntry("res/drawable-xxhdpi/$name.png"))
-                                              z.write(pngBytes)
-                                              z.closeEntry()
-                                          }
-                                      }
-                                      n++
-                                  }
-                                  runOnUiThread { status.text = "Рисую иконки: ${i + 1}/${apps.size}" }
+                              val dir = "res/drawable-xxhdpi/"
+                              fun put(name: String, data: ByteArray) {
+                                  if (written.add(name)) stored(z, name, data)
                               }
+                              put("transform_config.xml", config(v).toByteArray())
+                              put(dir + "icon_pattern.png", png(tileBitmap(v.bg)))
+                              put(dir + "icon_mask\$\$\$.png", png(tileBitmap(Color.WHITE)))
+                              // 1. иконки базовой темы: тот же рисунок, другие цвета
+                              for ((name, bm) in baseIcons) {
+                                  put(dir + name + ".png", png(recolor(bm, baseTile, baseLogo, v.bg, v.fg)))
+                                  seen.add(name)
+                                  n++
+                              }
+                              // 2. остальные установленные приложения: одна иконка на пакет
+                              for ((i, a) in uniq.withIndex()) {
+                                  if (!seen.contains(a.pkg)) {
+                                      val bm = render(a, v)
+                                      if (bm != null) {
+                                          put(dir + a.pkg + ".png", png(bm))
+                                          seen.add(a.pkg)
+                                          n++
+                                      }
+                                  }
+                                  runOnUiThread { status.text = "Рисую иконки: ${i + 1}/${uniq.size}" }
+                              }
+                              // 3. служебные файлы базовой темы (папки и т. п.)
+                              for ((nm, data) in baseExtra) put(nm, data)
                           }
                           val outer = ByteArrayOutputStream()
                           ZipOutputStream(outer).use { z ->
-                              z.putNextEntry(ZipEntry("description.xml"))
-                              z.write("""<?xml version="1.0" encoding="utf-8"?><theme><title>Kai Icons</title><author>Kai Icons</author><designer>Kai Icons</designer><version>1.0</version><uiVersion>12</uiVersion></theme>""".toByteArray())
-                              z.closeEntry()
-                              z.putNextEntry(ZipEntry("icons"))
-                              z.write(inner.toByteArray())
-                              z.closeEntry()
+                              stored(z, "description.xml", description().toByteArray())
+                              stored(z, "icons", inner.toByteArray())
                           }
                           val uri = saveMtz(outer.toByteArray())
                           runOnUiThread {
@@ -564,6 +845,16 @@ jobs:
                   layoutParams = LinearLayout.LayoutParams(px(size), px(size)).apply { setMargins(px(5), px(5), px(5), px(5)) }
               }
 
+              fun ring(v: V): Bitmap {
+                  val bm = tileBitmap(v.bg)
+                  val p = Paint(Paint.ANTI_ALIAS_FLAG)
+                  p.color = v.fg
+                  p.style = Paint.Style.STROKE
+                  p.strokeWidth = 192 * .09f
+                  Canvas(bm).drawCircle(96f, 96f, 192 * .22f, p)
+                  return bm
+              }
+
               fun refresh() {
                   val vs = variants()
                   val v = vs[sel]
@@ -586,8 +877,8 @@ jobs:
                   info.text = "фон #%06X · логотип #%06X · контраст %.1f:1".format(
                       v.bg and 0xFFFFFF, v.fg and 0xFFFFFF, ColorUtils.calculateContrast(v.fg, v.bg))
                   prev.removeAllViews()
-                  apps.take(6).forEach { a ->
-                      val bm = render(a, v)
+                  uniq.take(8).forEach { a ->
+                      val bm = baseIcon(a.pkg, v) ?: render(a, v)
                       prev.addView(iconView(bm, a.icon, 48))
                   }
               }
@@ -600,6 +891,7 @@ jobs:
                   apps = pm.queryIntentActivities(q, 0)
                       .distinctBy { it.activityInfo.name }
                       .map { App(it.activityInfo.packageName, it.activityInfo.name, it.loadIcon(pm)) }
+                  uniq = apps.distinctBy { it.pkg }
 
                   rootLL = LinearLayout(this).apply {
                       orientation = LinearLayout.VERTICAL
@@ -624,6 +916,14 @@ jobs:
                       startActivityForResult(Intent(Intent.ACTION_GET_CONTENT).setType("image/*"), 1)
                   }, LinearLayout.LayoutParams(0, -2, 1f))
                   c1.addView(row)
+
+                  val c0 = card("Базовая тема (необязательно)")
+                  baseInfo = tv("Выбери готовую тему .mtz, например «Розови»: её иконки останутся такими же и перекрасятся в твои цвета. Остальные приложения нарисуются сами.", 12f, 0xFFA89A96.toInt(), false)
+                  c0.addView(baseInfo)
+                  c0.addView(btn("Выбрать .mtz", 0xFF322A29.toInt(), 0xFFF1E6E2.toInt()) {
+                      @Suppress("DEPRECATION")
+                      startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*"), 2)
+                  }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = px(8) })
 
                   val c2 = card("Цвета")
                   sw = LinearLayout(this)
@@ -651,7 +951,7 @@ jobs:
                   prev = LinearLayout(this)
                   c3.addView(HorizontalScrollView(this).apply { addView(prev) })
                   val sc = Switch(this).apply {
-                      text = "Принудительный перекрас приложений (${apps.size})"
+                      text = "Принудительный перекрас приложений (${uniq.size})"
                       setTextColor(0xFFF1E6E2.toInt())
                       isChecked = true
                       setOnCheckedChangeListener { _, b -> force = b; refresh() }
@@ -664,11 +964,8 @@ jobs:
                       setOnCheckedChangeListener { _, b -> detail = b; refresh() }
                   }
                   c3.addView(sd, LinearLayout.LayoutParams(-1, -2).apply { topMargin = px(10) })
-                  c3.addView(slider("Размер плитки", 90, 130, 112) { tileK = it / 100f; refresh() },
-                      LinearLayout.LayoutParams(-1, -2).apply { topMargin = px(10) })
                   c3.addView(slider("Размер логотипа", 45, 85, 66) { logoK = it / 100f; refresh() },
-                      LinearLayout.LayoutParams(-1, -2).apply { topMargin = px(6) })
-                  c3.addView(tv("Если выключить, перекрасятся только приложения с монохромным слоем иконки (Android 13+).", 12f, 0xFFA89A96.toInt(), false))
+                      LinearLayout.LayoutParams(-1, -2).apply { topMargin = px(10) })
 
                   status = tv("", 13f, 0xFFA89A96.toInt(), false)
                   rootLL.addView(btn("✦ Создать иконки", 0xFFF4A58F.toInt(), 0xFF2A1410.toInt()) { create(it) },
@@ -684,4 +981,3 @@ jobs:
         with:
           name: KaiIcons-apk
           path: app/build/outputs/apk/debug/app-debug.apk
-                 
