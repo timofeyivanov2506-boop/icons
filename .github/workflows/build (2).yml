@@ -65,7 +65,7 @@ jobs:
                       <category android:name="android.intent.category.LAUNCHER" />
                   </intent>
               </queries>
-              <application android:label="MTZ Recolor" android:theme="@android:style/Theme.Material.NoActionBar">
+              <application android:largeHeap="true" android:label="MTZ Recolor" android:theme="@android:style/Theme.Material.NoActionBar">
                   <activity android:name=".MainActivity" android:exported="true">
                       <intent-filter>
                           <action android:name="android.intent.action.MAIN" />
@@ -98,6 +98,14 @@ jobs:
           import java.io.ByteArrayInputStream
           import java.io.ByteArrayOutputStream
           import java.util.zip.CRC32
+          import java.io.BufferedOutputStream
+          import java.io.File
+          import java.io.FileInputStream
+          import java.io.FileOutputStream
+          import java.util.concurrent.Callable
+          import java.util.concurrent.Executors
+          import java.util.concurrent.Future
+          import java.util.zip.ZipFile
           import java.util.zip.ZipEntry
           import java.util.zip.ZipInputStream
           import java.util.zip.ZipOutputStream
@@ -122,8 +130,11 @@ jobs:
               var sel = 0
               var customBg: Int? = null
               var customFg: Int? = null
-              val outerFiles = LinkedHashMap<String, ByteArray>()
-              val innerFiles = LinkedHashMap<String, ByteArray>()
+              val outerSmall = LinkedHashMap<String, ByteArray>()
+              var iconsFile: File? = null
+              var zf: ZipFile? = null
+              var allNames: List<String> = emptyList()
+              var iconNames: List<String> = emptyList()
               var srcName = "theme.mtz"
               var srcTile = 0
               var srcLogo = 0
@@ -324,8 +335,7 @@ jobs:
                       .setNegativeButton("Отмена", null)
                       .show()
               }
-
-              // ---------- чтение темы .mtz ----------
+                            // ---------- чтение темы .mtz ----------
               fun baseName(path: String) = path.substringAfterLast('/')
 
               // Какие файлы перекрашиваем: png в папках drawable, кроме масок и иконок папок
@@ -351,12 +361,19 @@ jobs:
                   return Color.parseColor(m.groupValues[1])
               }
 
+              fun readEntry(name: String): ByteArray? {
+                  val f = zf ?: return null
+                  val e = f.getEntry(name) ?: return null
+                  return f.getInputStream(e).use { it.readBytes() }
+              }
+
               // Определяем два главных цвета темы: плитка и логотип
-              fun detect(inner: Map<String, ByteArray>, names: List<String>): Pair<Int, Int>? {
+              fun detect(names: List<String>): Pair<Int, Int>? {
                   var tile = 0
-                  val pat = inner.entries.firstOrNull { baseName(it.key) == "icon_pattern.png" }
-                  if (pat != null) {
-                      val bm = BitmapFactory.decodeByteArray(pat.value, 0, pat.value.size)
+                  val patName = allNames.firstOrNull { baseName(it) == "icon_pattern.png" }
+                  if (patName != null) {
+                      val d = readEntry(patName)
+                      val bm = if (d != null) BitmapFactory.decodeByteArray(d, 0, d.size) else null
                       if (bm != null) {
                           val c = bm.getPixel(bm.width / 2, bm.height / 2)
                           if (Color.alpha(c) > 200) tile = c or 0xFF000000.toInt()
@@ -365,7 +382,7 @@ jobs:
                   val cnt = HashMap<Int, Int>()
                   var total = 0
                   for (nm in names.take(60)) {
-                      val data = inner[nm] ?: continue
+                      val data = readEntry(nm) ?: continue
                       val bm = BitmapFactory.decodeByteArray(data, 0, data.size) ?: continue
                       val w = bm.width
                       val h = bm.height
@@ -386,7 +403,8 @@ jobs:
                   fun bucket(k: Int) = Color.rgb(((k shr 10) and 31) * 8 + 4, ((k shr 5) and 31) * 8 + 4, (k and 31) * 8 + 4)
                   if (tile == 0) tile = bucket(cnt.maxByOrNull { it.value }!!.key)
                   var logo = 0
-                  val cfgBytes = inner.entries.firstOrNull { baseName(it.key) == "transform_config.xml" }?.value
+                  val cfgName = allNames.firstOrNull { baseName(it) == "transform_config.xml" }
+                  val cfgBytes = if (cfgName != null) readEntry(cfgName) else null
                   val cfg = if (cfgBytes != null) String(cfgBytes) else ""
                   val black = cfgColor(cfg, "BlackColor")
                   val white = cfgColor(cfg, "WhiteColor")
@@ -411,59 +429,81 @@ jobs:
                   return Pair(tile or 0xFF000000.toInt(), logo or 0xFF000000.toInt())
               }
 
-              fun readZip(bytes: ByteArray): LinkedHashMap<String, ByteArray> {
-                  val m = LinkedHashMap<String, ByteArray>()
-                  ZipInputStream(ByteArrayInputStream(bytes)).use { z ->
-                      var e = z.nextEntry
-                      while (e != null) {
-                          if (!e.isDirectory) m[e.name] = z.readBytes()
-                          e = z.nextEntry
-                      }
-                  }
-                  return m
-              }
-
+              // Тема читается потоком и через файлы в кэше, поэтому большие темы (тысячи иконок) не съедают память
               fun importPack(uri: Uri) {
-                  try {
-                      val bytes = contentResolver.openInputStream(uri)!!.use { it.readBytes() }
-                      val outer = readZip(bytes)
-                      val ib = outer["icons"] ?: throw Exception("в теме нет архива icons (иконок)")
-                      val inner = readZip(ib)
-                      val names = inner.keys.filter { isIcon(it) }
-                      if (names.isEmpty()) throw Exception("в теме нет png-иконок")
-                      val cols = detect(inner, names) ?: throw Exception("не удалось определить цвета темы")
-                      if (dist(cols.first, cols.second) < 30) throw Exception("плитка и логотип почти одного цвета")
-                      val pref = listOf("com.android.camera", "com.android.contacts.activities.TwelveKeyDialer",
-                          "com.android.settings", "com.miui.gallery", "com.whatsapp", "org.telegram.messenger",
-                          "com.android.chrome", "com.android.vending")
-                      val pn = ArrayList<String>()
-                      for (p in pref) {
-                          val f = names.firstOrNull { baseName(it) == p + ".png" }
-                          if (f != null) pn.add(f)
+                  packInfo.text = "Читаю тему…"
+                  Thread {
+                      try {
+                          zf?.close()
+                          zf = null
+                          val src = File(cacheDir, "src.mtz")
+                          contentResolver.openInputStream(uri)!!.use { ins -> FileOutputStream(src).use { ins.copyTo(it) } }
+                          val small = LinkedHashMap<String, ByteArray>()
+                          val iconsTmp = File(cacheDir, "icons_src.zip")
+                          var hasIcons = false
+                          ZipFile(src).use { zfo ->
+                              val en = zfo.entries()
+                              while (en.hasMoreElements()) {
+                                  val e = en.nextElement()
+                                  if (e.isDirectory) continue
+                                  if (e.name == "icons") {
+                                      zfo.getInputStream(e).use { ins -> FileOutputStream(iconsTmp).use { ins.copyTo(it) } }
+                                      hasIcons = true
+                                  } else if (e.size < 16L * 1024 * 1024) {
+                                      small[e.name] = zfo.getInputStream(e).use { it.readBytes() }
+                                  }
+                              }
+                          }
+                          src.delete()
+                          if (!hasIcons) throw Exception("в теме нет архива icons (иконок)")
+                          val f = ZipFile(iconsTmp)
+                          val all = ArrayList<String>()
+                          val en2 = f.entries()
+                          while (en2.hasMoreElements()) {
+                              val e = en2.nextElement()
+                              if (!e.isDirectory) all.add(e.name)
+                          }
+                          zf = f
+                          allNames = all
+                          val names = all.filter { isIcon(it) }
+                          if (names.isEmpty()) throw Exception("в теме нет png-иконок")
+                          val cols = detect(names) ?: throw Exception("не удалось определить цвета темы")
+                          if (dist(cols.first, cols.second) < 30) throw Exception("плитка и логотип почти одного цвета")
+                          val pref = listOf("com.android.camera", "com.android.contacts.activities.TwelveKeyDialer",
+                              "com.android.settings", "com.miui.gallery", "com.whatsapp", "org.telegram.messenger",
+                              "com.android.chrome", "com.android.vending")
+                          val pn = ArrayList<String>()
+                          for (p in pref) {
+                              val nm = names.firstOrNull { baseName(it) == p + ".png" }
+                              if (nm != null) pn.add(nm)
+                          }
+                          for (nm in names) {
+                              if (pn.size >= 8) break
+                              if (!pn.contains(nm)) pn.add(nm)
+                          }
+                          val bms = ArrayList<Bitmap>()
+                          for (nm in pn.take(8)) {
+                              val d = readEntry(nm) ?: continue
+                              val bm = BitmapFactory.decodeByteArray(d, 0, d.size)
+                              if (bm != null) bms.add(bm)
+                          }
+                          val dn = displayName(uri)
+                          runOnUiThread {
+                              outerSmall.clear()
+                              outerSmall.putAll(small)
+                              iconsFile = iconsTmp
+                              iconNames = names
+                              srcName = dn
+                              srcTile = cols.first
+                              srcLogo = cols.second
+                              prevBitmaps = bms
+                              packInfo.text = dn + "\nИконок: " + names.size + " · плитка " + hex(srcTile) + " · логотип " + hex(srcLogo)
+                              refresh()
+                          }
+                      } catch (e: Throwable) {
+                          runOnUiThread { packInfo.text = "Не удалось прочитать тему: " + e.toString() }
                       }
-                      for (f in names) {
-                          if (pn.size >= 8) break
-                          if (!pn.contains(f)) pn.add(f)
-                      }
-                      val bms = ArrayList<Bitmap>()
-                      for (f in pn.take(8)) {
-                          val d = inner[f] ?: continue
-                          val bm = BitmapFactory.decodeByteArray(d, 0, d.size)
-                          if (bm != null) bms.add(bm)
-                      }
-                      outerFiles.clear()
-                      outerFiles.putAll(outer)
-                      innerFiles.clear()
-                      innerFiles.putAll(inner)
-                      srcName = displayName(uri)
-                      srcTile = cols.first
-                      srcLogo = cols.second
-                      prevBitmaps = bms
-                      packInfo.text = srcName + "\nИконок: " + names.size + " · плитка " + hex(srcTile) + " · логотип " + hex(srcLogo)
-                      refresh()
-                  } catch (e: Throwable) {
-                      packInfo.text = "Не удалось прочитать тему: " + e.message
-                  }
+                  }.start()
               }
 
               // ---------- перекраска ----------
@@ -540,8 +580,20 @@ jobs:
                   }
               }
 
+              fun saveMtzFile(src: File, fileName: String): Uri? {
+                  val cv = ContentValues().apply {
+                      put(MediaStore.Downloads.DISPLAY_NAME, fileName)
+                      put(MediaStore.Downloads.MIME_TYPE, "application/octet-stream")
+                      put(MediaStore.Downloads.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                  }
+                  val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv) ?: return null
+                  contentResolver.openOutputStream(uri)!!.use { out -> FileInputStream(src).use { it.copyTo(out) } }
+                  return uri
+              }
+
               fun create(btn: Button) {
-                  if (innerFiles.isEmpty()) {
+                  val f = zf
+                  if (f == null || iconsFile == null) {
                       status.text = "Сначала выберите тему .mtz."
                       return
                   }
@@ -549,47 +601,75 @@ jobs:
                   val v = variants()[sel]
                   val t0 = srcTile
                   val l0 = srcLogo
+                  val small = LinkedHashMap(outerSmall)
+                  val total = iconNames.size
+                  val sName = srcName
                   Thread {
+                      val pool = Executors.newFixedThreadPool(4)
+                      val tmpIcons = File(cacheDir, "out_icons.zip")
+                      val tmpOuter = File(cacheDir, "out.mtz")
                       try {
-                          val inner = ByteArrayOutputStream()
                           var n = 0
-                          ZipOutputStream(inner).use { z ->
-                              val total = innerFiles.size
-                              var i = 0
-                              for ((name, data) in innerFiles) {
-                                  i++
-                                  var out = data
-                                  if (isIcon(name)) {
-                                      val bm = BitmapFactory.decodeByteArray(data, 0, data.size)
-                                      if (bm != null) {
-                                          out = png(recolor(bm, t0, l0, v.bg, v.fg))
-                                          n++
-                                      }
-                                  } else if (baseName(name) == "transform_config.xml") {
-                                      out = newConfig(String(data), v).toByteArray()
+                          ZipOutputStream(BufferedOutputStream(FileOutputStream(tmpIcons))).use { z ->
+                              val batch = ArrayList<Pair<String, Future<ByteArray>>>()
+                              fun flush() {
+                                  for ((nm, fu) in batch) {
+                                      stored(z, nm, fu.get())
+                                      n++
                                   }
-                                  stored(z, name, out)
-                                  val cur = i
+                                  batch.clear()
+                                  val cur = n
                                   runOnUiThread { status.text = "Перекрашиваю: $cur/$total" }
                               }
-                          }
-                          val outer = ByteArrayOutputStream()
-                          ZipOutputStream(outer).use { z ->
-                              for ((name, data) in outerFiles) {
-                                  val out = when (name) {
-                                      "icons" -> inner.toByteArray()
-                                      "description.xml" -> retitle(String(data)).toByteArray()
-                                      else -> data
+                              val en = f.entries()
+                              while (en.hasMoreElements()) {
+                                  val e = en.nextElement()
+                                  if (e.isDirectory) continue
+                                  val name = e.name
+                                  val data = f.getInputStream(e).use { it.readBytes() }
+                                  if (isIcon(name)) {
+                                      batch.add(Pair(name, pool.submit(Callable<ByteArray> {
+                                          val bm = BitmapFactory.decodeByteArray(data, 0, data.size)
+                                          if (bm != null) png(recolor(bm, t0, l0, v.bg, v.fg)) else data
+                                      })))
+                                      if (batch.size >= 32) flush()
+                                  } else if (baseName(name) == "transform_config.xml") {
+                                      stored(z, name, newConfig(String(data), v).toByteArray())
+                                  } else {
+                                      stored(z, name, data)
                                   }
-                                  stored(z, name, out)
+                              }
+                              flush()
+                          }
+                          val crc = CRC32()
+                          FileInputStream(tmpIcons).use { ins ->
+                              val buf = ByteArray(65536)
+                              while (true) {
+                                  val r = ins.read(buf)
+                                  if (r <= 0) break
+                                  crc.update(buf, 0, r)
                               }
                           }
-                          val outName = srcName.removeSuffix(".mtz") + "_Kai.mtz"
-                          val uri = saveMtz(outer.toByteArray(), outName)
+                          ZipOutputStream(BufferedOutputStream(FileOutputStream(tmpOuter))).use { z ->
+                              for ((name, data) in small) {
+                                  stored(z, name, if (name == "description.xml") retitle(String(data)).toByteArray() else data)
+                              }
+                              val e = ZipEntry("icons")
+                              e.method = ZipEntry.STORED
+                              e.size = tmpIcons.length()
+                              e.compressedSize = tmpIcons.length()
+                              e.crc = crc.value
+                              z.putNextEntry(e)
+                              FileInputStream(tmpIcons).use { it.copyTo(z) }
+                              z.closeEntry()
+                          }
+                          val outName = sName.removeSuffix(".mtz") + "_Kai.mtz"
+                          val uri = saveMtzFile(tmpOuter, outName)
+                          val done = n
                           runOnUiThread {
                               btn.isEnabled = true
                               lastUri = uri
-                              status.text = "Готово: перекрашено иконок $n. Файл $outName лежит в Загрузках."
+                              status.text = "Готово: перекрашено иконок $done. Файл $outName лежит в Загрузках."
                               if (uri != null) {
                                   openBtn.visibility = View.VISIBLE
                                   openInThemes(uri)
@@ -598,13 +678,16 @@ jobs:
                       } catch (e: Throwable) {
                           runOnUiThread {
                               btn.isEnabled = true
-                              status.text = "Ошибка: " + e.message
+                              status.text = "Ошибка: " + e.toString()
                           }
+                      } finally {
+                          pool.shutdown()
+                          tmpIcons.delete()
+                          tmpOuter.delete()
                       }
                   }.start()
               }
-
-              // ---------- интерфейс ----------
+                            // ---------- интерфейс ----------
               fun tv(t: String, size: Float, color: Int, bold: Boolean) = TextView(this).apply {
                   text = t; textSize = size; setTextColor(color)
                   if (bold) setTypeface(typeface, Typeface.BOLD)
@@ -785,3 +868,4 @@ jobs:
         with:
           name: KaiIcons-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+              
