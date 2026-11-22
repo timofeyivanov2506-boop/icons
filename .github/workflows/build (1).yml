@@ -92,6 +92,7 @@ jobs:
           import android.os.Bundle
           import android.os.Environment
           import android.provider.MediaStore
+          import android.util.Log
           import android.view.Gravity
           import android.widget.*
           import androidx.core.graphics.ColorUtils
@@ -104,7 +105,7 @@ jobs:
           import kotlin.math.*
 
           // Профиль края плитки (как в эталонной теме): смещение левого края для верхних 96 строк
-          private val EDGE = floatArrayOf(38.23f, 33.13f, 29.71f, 27.06f, 24.83f, 22.89f, 21.13f, 19.58f, 18.13f, 16.85f, 15.63f, 14.43f, 13.37f, 12.37f, 11.43f, 10.63f, 9.81f, 8.98f, 8.17f, 7.58f, 6.93f, 6.2f, 5.79f, 5.1f, 4.74f, 4.11f, 3.81f, 3.23f, 2.95f, 2.61f, 2.16f, 1.95f, 1.73f, 1.34f, 1.13f, 0.98f, 0.84f, 0.67f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f)
+          private val EDGE = floatArrayOf(38.23f, 33.13f, 29.71f, 27.06f, 24.83f, 22.89f, 21.13f, 19.58f, 18.13f, 16.85f, 15.63f, 14.43f, 13.37f, 12.37f, 11.43f, 10.63f, 9.81f, 8.98f, 8.17f, 7.58f, 6.93f, 6.2f, 5.79f, 5.1f, 4.74f, 4.11f, 3.81f, 3.23f, 2.95f, 2.61f, 2.16f, 1.95f, 1.73f, 1.34f, 1.13f, 0.98f, 0.84f, 0.67f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f)
 
           class MainActivity : Activity() {
               class V(val name: String, val bg: Int, val fg: Int)
@@ -128,6 +129,9 @@ jobs:
               var force = true
               var detail = true
               var logoK = .66f
+              var customBg: Int? = null
+              var customFg: Int? = null
+              var lastErr = ""
               val baseIcons = LinkedHashMap<String, Bitmap>()
               val baseExtra = LinkedHashMap<String, ByteArray>()
               var baseTile = 0
@@ -154,13 +158,17 @@ jobs:
               fun variants(): List<V> {
                   val h = baseH
                   val s = min(baseS, .6f)
-                  return listOf(
+                  val list = arrayListOf(
                       V("Тёмный", hsl(h, s * .6f, .17f), hsl(h, max(.25f, s), .82f)),
                       V("Светлый", hsl(h, s * .6f, .94f), hsl(h, max(.3f, s), .36f)),
                       V("Яркий", hsl(h, max(.5f, baseS), .46f), hsl(h, .6f, .93f)),
                       V("Тональный", hsl(h, s * .5f, .30f), hsl(h, s * .6f, .78f)),
                       V("Акцент", hsl(accentH, s * .5f, .20f), hsl(h, max(.45f, s), .72f))
                   )
+                  val cb = customBg
+                  val cf = customFg
+                  if (cb != null && cf != null) list.add(V("Своё", cb, cf))
+                  return list
               }
 
               // ---------- общие помощники ----------
@@ -348,6 +356,13 @@ jobs:
                   return Bitmap.createBitmap(p, w, w, Bitmap.Config.ARGB_8888)
               }
 
+              fun safeRender(a: App, v: V): Bitmap? = try {
+                  render(a, v)
+              } catch (e: Throwable) {
+                  lastErr = a.pkg + ": " + e.toString()
+                  null
+              }
+
               // Своя иконка для приложения, которого нет в базовой теме. null = не перекрашиваем
               fun render(app: App, v: V): Bitmap? {
                   val d = app.icon
@@ -360,6 +375,18 @@ jobs:
                       if (Build.VERSION.SDK_INT >= 33) {
                           layer = d.monochrome
                           mono = layer != null
+                          if (layer != null) {
+                              // подложка (круг или плитка с вырезанным знаком): берём передний слой, а не монохромный
+                              val mb = layerBmp(listOf(layer))
+                              val mp0 = IntArray(mb.width * mb.height)
+                              mb.getPixels(mp0, 0, mb.width, 0, 0, mb.width, mb.height)
+                              var cv = 0
+                              for (q in mp0) if (Color.alpha(q) > 128) cv++
+                              if (cv > mp0.size * .5) {
+                                  layer = null
+                                  mono = false
+                              }
+                          }
                       }
                       if (layer == null) {
                           if (!force) return null
@@ -524,7 +551,7 @@ jobs:
                       baseLogo = logo or 0xFF000000.toInt()
                       baseInfo.text = "Загружено иконок: ${icons.size}. Они сохранятся как есть и перекрасятся в твои цвета."
                       refresh()
-                  } catch (e: Exception) {
+                  } catch (e: Throwable) {
                       baseInfo.text = "Не удалось прочитать тему: ${e.message}"
                   }
               }
@@ -761,7 +788,7 @@ jobs:
                               // 2. остальные установленные приложения: одна иконка на пакет
                               for ((i, a) in uniq.withIndex()) {
                                   if (!seen.contains(a.pkg)) {
-                                      val bm = render(a, v)
+                                      val bm = safeRender(a, v)
                                       if (bm != null) {
                                           put(dir + a.pkg + ".png", png(bm))
                                           seen.add(a.pkg)
@@ -855,6 +882,64 @@ jobs:
                   return bm
               }
 
+              fun parseHex(s: String): Int? {
+                  var t = s.trim().removePrefix("#")
+                  if (t.length == 3) t = t.map { "$it$it" }.joinToString("")
+                  if (t.length != 6) return null
+                  return try {
+                      Color.parseColor("#" + t)
+                  } catch (e: Exception) {
+                      null
+                  }
+              }
+
+              // Цвет логотипа под выбранную плитку: тот же оттенок, но с контрастом не меньше 4.5:1
+              fun autoLogo(bg: Int): Int {
+                  val hh = FloatArray(3)
+                  ColorUtils.colorToHSL(bg, hh)
+                  val darkBg = lum(bg) < .5
+                  val c = ColorUtils.HSLToColor(floatArrayOf(hh[0], min(hh[1] + .1f, .8f), if (darkBg) .85f else .2f))
+                  if (ColorUtils.calculateContrast(c, bg) >= 4.5) return c
+                  return if (darkBg) 0xFFFFFFFF.toInt() else 0xFF000000.toInt()
+              }
+
+              fun customDialog() {
+                  val box = LinearLayout(this)
+                  box.orientation = LinearLayout.VERTICAL
+                  box.setPadding(px(20), px(8), px(20), 0)
+                  val e1 = EditText(this)
+                  e1.hint = "Цвет плитки, например 432606"
+                  e1.setSingleLine()
+                  val e2 = EditText(this)
+                  e2.hint = "Цвет логотипа (можно оставить пустым)"
+                  e2.setSingleLine()
+                  box.addView(e1)
+                  box.addView(e2)
+                  android.app.AlertDialog.Builder(this)
+                      .setTitle("Свой цвет (HEX)")
+                      .setView(box)
+                      .setPositiveButton("Применить") { _, _ ->
+                          val a = parseHex(e1.text.toString())
+                          if (a == null) {
+                              status.text = "Неверный цвет плитки. Нужно 6 символов 0-9 и A-F, например 432606."
+                          } else {
+                              val bg = a or 0xFF000000.toInt()
+                              val fg = (parseHex(e2.text.toString()) ?: autoLogo(bg)) or 0xFF000000.toInt()
+                              customBg = bg
+                              customFg = fg
+                              val h3 = FloatArray(3)
+                              ColorUtils.colorToHSL(bg, h3)
+                              baseH = h3[0]
+                              baseS = h3[1].coerceIn(.15f, .9f)
+                              sel = 5
+                              refresh()
+                              status.text = "Свой цвет применён."
+                          }
+                      }
+                      .setNegativeButton("Отмена", null)
+                      .show()
+              }
+
               fun refresh() {
                   val vs = variants()
                   val v = vs[sel]
@@ -878,13 +963,23 @@ jobs:
                       v.bg and 0xFFFFFF, v.fg and 0xFFFFFF, ColorUtils.calculateContrast(v.fg, v.bg))
                   prev.removeAllViews()
                   uniq.take(8).forEach { a ->
-                      val bm = baseIcon(a.pkg, v) ?: render(a, v)
+                      val bm = baseIcon(a.pkg, v) ?: safeRender(a, v)
                       prev.addView(iconView(bm, a.icon, 48))
                   }
+                  if (lastErr.isNotEmpty()) status.text = "Ошибка иконки " + lastErr
               }
 
               override fun onCreate(s: Bundle?) {
                   super.onCreate(s)
+                  val prefs = getSharedPreferences("kai", MODE_PRIVATE)
+                  val oldH = Thread.getDefaultUncaughtExceptionHandler()
+                  Thread.setDefaultUncaughtExceptionHandler { t, e ->
+                      try {
+                          prefs.edit().putString("crash", Log.getStackTraceString(e).take(1800)).commit()
+                      } catch (x: Throwable) {
+                      }
+                      oldH?.uncaughtException(t, e)
+                  }
                   density = resources.displayMetrics.density
                   val pm = packageManager
                   val q = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
@@ -930,22 +1025,8 @@ jobs:
                   c2.addView(HorizontalScrollView(this).apply { addView(sw) })
                   info = tv("", 12f, 0xFFA89A96.toInt(), false)
                   c2.addView(info)
-                  c2.addView(btn("✎ Свой цвет (HEX)", 0xFF322A29.toInt(), 0xFFF1E6E2.toInt()) {
-                      val et = EditText(this)
-                      et.setText("#")
-                      android.app.AlertDialog.Builder(this)
-                          .setTitle("HEX-цвет, например #7A4A2A")
-                          .setView(et)
-                          .setPositiveButton("OK") { _, _ ->
-                              try {
-                                  setBaseFromColor(Color.parseColor(et.text.toString().trim()))
-                              } catch (e: Exception) {
-                                  status.text = "Неверный цвет"
-                              }
-                          }
-                          .setNegativeButton("Отмена", null)
-                          .show()
-                  }, LinearLayout.LayoutParams(-1, -2).apply { topMargin = px(8) })
+                  c2.addView(btn("✎ Свой цвет (HEX)", 0xFF322A29.toInt(), 0xFFF1E6E2.toInt()) { customDialog() },
+                      LinearLayout.LayoutParams(-1, -2).apply { topMargin = px(8) })
 
                   val c3 = card("Так будет выглядеть")
                   prev = LinearLayout(this)
@@ -971,7 +1052,17 @@ jobs:
                   rootLL.addView(btn("✦ Создать иконки", 0xFFF4A58F.toInt(), 0xFF2A1410.toInt()) { create(it) },
                       LinearLayout.LayoutParams(-1, px(56)).apply { topMargin = px(14) })
                   rootLL.addView(status, LinearLayout.LayoutParams(-1, -2).apply { topMargin = px(8) })
-                  refresh()
+                  try {
+                      refresh()
+                  } catch (e: Throwable) {
+                      status.text = "Ошибка при запуске: " + Log.getStackTraceString(e).take(1200)
+                  }
+                  val crash = prefs.getString("crash", null)
+                  if (crash != null) {
+                      status.text = "Прошлый вылет:\n" + crash
+                      prefs.edit().remove("crash").apply()
+                  }
+                  status.setTextIsSelectable(true)
               }
           }
           KAI_EOF
